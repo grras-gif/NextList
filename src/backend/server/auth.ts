@@ -14,7 +14,13 @@ import {
   buildQrImageUrl,
 } from "../pkg/totp"
 import { getJwtSecret, revokeToken, isTokenRevoked } from "./middlewares"
-import { staticHash, setUserPassword } from "../pkg/password"
+import {
+  staticHash,
+  setUserPassword,
+  saltedHash,
+  generateSalt,
+  isHex64,
+} from "../pkg/password"
 import { setCSRFToken, clearCSRFToken } from "../pkg/csrf"
 import { getAuditLogger } from "../pkg/audit"
 
@@ -277,6 +283,14 @@ export async function validateUserPassword(
   const stored = String(user?.password || "")
   if (stored === rawPassword) return true
   if (await verifyUserPasswordFromPlain(user, rawPassword)) return true
+  // 兼容历史缺陷：登录迁移曾把已哈希凭据当明文二次哈希，识别该产物以便放行并就地修复
+  if (stored && user?.salt) {
+    const staticHex = isHex64(rawPassword)
+      ? rawPassword
+      : await staticHash(rawPassword)
+    const buggy = await saltedHash(await staticHash(staticHex), user.salt)
+    if (buggy === stored) return true
+  }
   // bootstrap admin/admin 默认值兼容
   const defaultAdminHash = await staticHash("admin")
   if (stored === "" || stored === "admin" || stored === defaultAdminHash) {
@@ -401,12 +415,33 @@ async function issueSession(c: any, user: any) {
 async function finalizeLoginSuccess(
   c: any,
   matchedUser: any,
-  rawPassword: string,
+  credential: string,
 ) {
   await clearLoginFailures(c, matchedUser.username, c.env)
-  // 无 salt 的历史单层格式 -> 迁移为双层（带 per-user 盐）
+  // 凭据可能已是静态哈希（/login/hash 前端哈希），不能再当明文二次哈希
+  const staticHex = isHex64(credential)
+    ? credential
+    : await staticHash(credential)
+  let changed = false
   if (!matchedUser.salt) {
-    await setUserPassword(matchedUser, rawPassword)
+    // 无 salt 的历史单层/空口令 -> 迁移为双层（带 per-user 盐）
+    matchedUser.salt = generateSalt()
+    matchedUser.password = await saltedHash(staticHex, matchedUser.salt)
+    matchedUser.pwd_update_at = new Date().toISOString()
+    changed = true
+  } else {
+    const correct = await saltedHash(staticHex, matchedUser.salt)
+    if (matchedUser.password !== correct) {
+      // 修复历史缺陷产物（凭据曾被当明文二次哈希）
+      const buggy = await saltedHash(await staticHash(staticHex), matchedUser.salt)
+      if (matchedUser.password === buggy) {
+        matchedUser.password = correct
+        matchedUser.pwd_update_at = new Date().toISOString()
+        changed = true
+      }
+    }
+  }
+  if (changed) {
     const db = await getDb(c.env)
     const idx = (db.users || []).findIndex((u: any) => u.id === matchedUser.id)
     if (idx !== -1) {
