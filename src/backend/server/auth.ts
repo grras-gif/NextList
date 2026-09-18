@@ -280,7 +280,7 @@ export async function validateUserPassword(
   // bootstrap admin/admin 默认值兼容
   const defaultAdminHash = await staticHash("admin")
   if (stored === "" || stored === "admin" || stored === defaultAdminHash) {
-    return rawPassword === "admin"
+    return rawPassword === "admin" || rawPassword === defaultAdminHash
   }
   return false
 }
